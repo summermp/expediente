@@ -1,186 +1,237 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datos import expedientes
+
+# ==========================================
+# CONFIGURACIÓN
+# ==========================================
 
 API_URL = (
     "https://apiplataformaelectoral3.jne.gob.pe/api/v1/"
     "expediente/detalle?CodExpedienteExt={}"
 )
 
+MAX_WORKERS = 30
 
-# =========================
-# CONSULTA API
-# =========================
+# ==========================================
+# SESSION HTTP (MUCHO MÁS RÁPIDA)
+# ==========================================
+
+session = requests.Session()
+
+retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+
+adapter = HTTPAdapter(
+    max_retries=retry,
+    pool_connections=MAX_WORKERS,
+    pool_maxsize=MAX_WORKERS
+)
+
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+
+# ==========================================
+# CONSULTAR UN EXPEDIENTE
+# ==========================================
+
 def consultar_api(item):
+
     expediente = item["expediente"]
-    entidad = item["entidad"]
+
     codigo_api = f"ERM.2026{expediente}"
 
-    estado_lista = ""
-    ruta_pronunciamiento = ""
-
     try:
-        r = requests.get(API_URL.format(codigo_api), timeout=20)
+
+        r = session.get(
+            API_URL.format(codigo_api),
+            timeout=8
+        )
+
         r.raise_for_status()
+
         data = r.json()
 
-        estado_lista = (
+        estado = (
             data.get("datoGeneral", {})
             .get("estadoLista", "")
             .strip()
             .upper()
         )
 
-        for actuado in data.get("expedienteActuado", []):
-            if actuado.get("txTipoExpediente") == "PRONUNCIAMIENTO":
-                ruta_pronunciamiento = actuado.get("txRutaDocumento", "")
-                break
+        pron = next(
+            (
+                x
+                for x in data.get("expedienteActuado", [])
+                if x.get("txTipoExpediente") == "PRONUNCIAMIENTO"
+            ),
+            {}
+        )
+
+        return {
+            "Expediente": expediente,
+            "Entidad": item["entidad"],
+            "Estado Lista": estado,
+            "Ruta Documento": pron.get("txRutaDocumento", ""),
+            "Fecha Publicación": pron.get("txFechaPublicacion", "")
+        }
 
     except Exception:
-        estado_lista = "ERROR"
 
-    return {
-        "Expediente": expediente,
-        "Entidad": entidad,
-        "Estado Lista": estado_lista,
-        "Ruta Documento": ruta_pronunciamiento
-    }
+        return {
+            "Expediente": expediente,
+            "Entidad": item["entidad"],
+            "Estado Lista": "ERROR",
+            "Ruta Documento": "",
+            "Fecha Publicación": ""
+        }
 
 
-# =========================
-# CONSULTAR TODOS (CON PROGRESO)
-# =========================
+# ==========================================
+# CONSULTA PARALELA
+# ==========================================
+
 def consultar_todos_expedientes():
+
     resultados = []
+
     total = len(expedientes)
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    barra = st.progress(0)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(consultar_api, item): item for item in expedientes}
+    texto = st.empty()
+
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_WORKERS, total)
+    ) as executor:
+
+        futures = [
+            executor.submit(consultar_api, item)
+            for item in expedientes
+        ]
 
         for i, future in enumerate(as_completed(futures), 1):
-            resultado = future.result()
-            resultados.append(resultado)
-            progress_bar.progress(i / total)
-            status_text.text(f"Consultando {i} de {total} expedientes...")
 
-    status_text.text("✅ ¡Consulta completada!")
+            resultados.append(future.result())
+
+            if i % 5 == 0 or i == total:
+                barra.progress(i / total)
+                texto.text(f"Consultando {i}/{total}")
+
+    barra.empty()
+    texto.empty()
+
     return resultados
 
 
-# =========================
-# CLASIFICAR RESULTADOS
-# =========================
+# ==========================================
+# CLASIFICACIÓN
+# ==========================================
+
 def clasificar_expedientes(resultados):
+
     admitidos = []
     inadmisibles = []
     recibidos = []
 
     for item in resultados:
-        estado = item.get("Estado Lista", "")
+
+        estado = item["Estado Lista"]
 
         if "ADMIT" in estado:
-            admitidos.append(item)
+
+            admitidos.append({
+                "Expediente": item["Expediente"],
+                "Entidad": item["Entidad"],
+                "Estado Lista": estado,
+                "Fecha Publicación": item["Fecha Publicación"]
+            })
+
         elif "INADM" in estado:
+
             inadmisibles.append(item)
-        elif "RECIBID" in estado:
-            recibidos.append(item)
+
         else:
-            # Si no tiene estado definido, lo ponemos como recibido por defecto
-            # o puedes crear una categoría "PENDIENTE"
+
             recibidos.append(item)
 
     return admitidos, inadmisibles, recibidos
 
 
-# =========================
-# MOSTRAR TABLA
-# =========================
-def mostrar_tabla(datos, titulo, color):
-    st.subheader(f"{color} {titulo}")
+# ==========================================
+# TABLAS
+# ==========================================
 
-    if datos:
-        df = pd.DataFrame(datos)
+def mostrar_tabla(datos, titulo):
 
-        # El índice empieza en 1 y se llama "#"
-        df.index = range(1, len(df) + 1)
-        df.index.name = "#"
+    st.subheader(titulo)
 
-        st.dataframe(
-            df,
-            width="stretch",
-            column_config={
-                "#": st.column_config.NumberColumn(
-                    "#",
-                    width="small"
-                ),
-                "Ruta Documento": st.column_config.LinkColumn(
-                    "Ruta Documento",
-                    display_text="Abrir"
-                )
-            }
-        )
+    if not datos:
+        st.info("Sin resultados")
+        return
 
-        st.caption(f"Total: {len(datos)} expedientes")
-    else:
-        st.info(f"No hay expedientes {titulo.lower()}")
+    df = pd.DataFrame(datos)
+
+    df.index = range(1, len(df) + 1)
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        column_config={
+            "Ruta Documento": st.column_config.LinkColumn(
+                "Ruta Documento",
+                display_text="Abrir"
+            )
+        }
+    )
+
+    st.caption(f"{len(df)} expedientes")
 
 
-# =========================
-# UI PRINCIPAL
-# =========================
-st.set_page_config(page_title="Consulta JNE", layout="wide")
+# ==========================================
+# INTERFAZ
+# ==========================================
 
- # =========================
-# BOTÓN PRINCIPAL
-# =========================
-col1, col2, col3 = st.columns([2, 1, 2])
-with col2:
-    if st.button("🔄 Consultar Expedientes", use_container_width=True):
-        st.session_state['resultados'] = consultar_todos_expedientes()
+st.set_page_config(
+    page_title="Consulta JNE",
+    layout="wide"
+)
 
-# =========================
-# MOSTRAR RESULTADOS (SI EXISTEN)
-# =========================
-if 'resultados' in st.session_state and st.session_state['resultados']:
-    resultados = st.session_state['resultados']
+if st.button(
+    "Consultar Expedientes",
+    use_container_width=True
+):
 
-    # Clasificar
+    st.session_state["resultados"] = consultar_todos_expedientes()
+
+if "resultados" in st.session_state:
+
+    resultados = st.session_state["resultados"]
+
     admitidos, inadmisibles, recibidos = clasificar_expedientes(resultados)
 
-    mostrar_tabla(admitidos, "✅ ADMITIDOS", "🟢")
+    mostrar_tabla(admitidos, "Admitidos")
 
-    mostrar_tabla(inadmisibles, "❌ INADMISIBLES", "🔴")
+    mostrar_tabla(inadmisibles, "Inadmisibles")
 
-    mostrar_tabla(recibidos, "📋 RECIBIDOS", "🟡")
+    mostrar_tabla(recibidos, "Recibidos")
 
-    # Estadísticas generales
-    st.markdown("---")
-    st.subheader("📊 Resumen General")
+    st.divider()
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Expedientes", len(resultados))
-    with col2:
-        st.metric("Admitidos", len(admitidos),
-                  delta=f"{len(admitidos)/len(resultados)*100:.1f}%")
-    with col3:
-        st.metric("Inadmisibles", len(inadmisibles),
-                  delta=f"{len(inadmisibles)/len(resultados)*100:.1f}%")
-    with col4:
-        st.metric("Recibidos", len(recibidos),
-                  delta=f"{len(recibidos)/len(resultados)*100:.1f}%")
+    total = len(resultados)
 
-else:
-    st.info("👆 Haz clic en 'Consultar Expedientes' para obtener la información actualizada")
+    c1, c2, c3, c4 = st.columns(4)
 
-# =========================
-# PIE DE PÁGINA
-# =========================
-st.markdown("---")
-st.caption("🔹 Datos obtenidos de la API del JNE - Actualización en tiempo real")
+    c1.metric("Total", total)
+    c2.metric("Admitidos", len(admitidos))
+    c3.metric("Inadmisibles", len(inadmisibles))
+    c4.metric("Recibidos", len(recibidos))
