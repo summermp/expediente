@@ -39,5 +39,4 @@ expedientes = [
     {"expediente": "014702", "entidad": "MUNICIPAL DISTRITAL HUANUCO - DOS DE MAYO - CHUQUIS"},
     {"expediente": "014132", "entidad": "MUNICIPAL DISTRITAL HUANUCO - HUAMALIES - MONZON"},
     {"expediente": "013986", "entidad": "MUNICIPAL DISTRITAL HUANUCO - HUANUCO - SAN PEDRO DE CHAULAN"},
-    {"expediente": "009782", "entidad": "#N/D"},
 ]
