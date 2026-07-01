@@ -1,0 +1,6 @@
+streamlit>=1.46
+aiohttp>=3.11
+aiodns>=3.2
+orjson>=3.10
+pandas>=2.2
+cachetools>=5.5
