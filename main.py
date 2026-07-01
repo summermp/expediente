@@ -274,8 +274,6 @@ def mostrar_tabla(datos, titulo, height=None):
         column_config=column_config,
         width='stretch'
     )
-    
-    st.caption(f"{len(df)} expedientes")
 
 # ==========================================
 # INTERFAZ OPTIMIZADA CON CSS
@@ -364,7 +362,7 @@ with col2:
     # Botón con auto-deshabilitado
     if st.button(
         "🔍 CONSULTAR EXPEDIENTES", 
-        use_container_width=True, 
+        width='stretch', 
         type="secondary",
         disabled=st.session_state.procesando
     ):
@@ -396,8 +394,7 @@ if "resultados" in st.session_state:
     tabs = st.tabs([
         "✅ Admitidos",
         "❌ Inadmisibles", 
-        "📦 Recibidos",
-        "⚠️ Errores"
+        "📦 Recibidos"
     ])
     
     with tabs[0]:
@@ -409,15 +406,13 @@ if "resultados" in st.session_state:
     with tabs[2]:
         mostrar_tabla(recibidos, "📦 Recibidos")
     
-    with tabs[3]:
-        mostrar_tabla(errores, "⚠️ Errores")
     
     # ==========================================
     # MÉTRICAS DE RESUMEN CENTRADAS
     # ==========================================
     #     
     # Centrar métricas
-    col1, col2, col3 = st.columns([1, 6, 1])
+    col1, col2, col3 = st.columns([2, 4, 2])
     
     with col2:
         m1, m2, m3, m4 = st.columns(4)
