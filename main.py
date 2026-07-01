@@ -278,7 +278,11 @@ if st.session_state.resultados:
     
     # Última actualización
     if st.session_state.last_refresh:
-        st.markdown(f"🕐 Actualizado: {st.session_state.last_refresh.strftime('%H:%M:%S')} | Total 40 expedientes")
+    if st.session_state.last_refresh:
+        from datetime import timezone, timedelta
+        peru_offset = timezone(timedelta(hours=-5))
+        hora_peru = st.session_state.last_refresh.astimezone(peru_offset)
+        st.markdown(f"🕐 Actualizado: {hora_peru.strftime('%H:%M:%S')} | Total 40 expedientes")
     
     # Tabs
     tab1, tab2, tab3 = st.tabs(["✅ Admitidos "+str(len(admitidos)), "❌ Inadmisibles "+str(len(inadmisibles)), "📦 Recibidos "+str(len(recibidos))])
