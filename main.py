@@ -278,7 +278,6 @@ if st.session_state.resultados:
     
     # Última actualización
     if st.session_state.last_refresh:
-    if st.session_state.last_refresh:
         from datetime import timezone, timedelta
         peru_offset = timezone(timedelta(hours=-5))
         hora_peru = st.session_state.last_refresh.astimezone(peru_offset)
