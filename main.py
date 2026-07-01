@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app_jne_async.py - Versión asíncrona de alto rendimiento y robustez para consultas al JNE.
-Soluciona problemas de pérdida de datos, bloqueos de API y velocidad en Streamlit.
+app_jne_async.py - Ultra rápido con Redis Cloud + Auto-refresh inteligente
 """
 
 import streamlit as st
@@ -9,145 +8,195 @@ import pandas as pd
 import asyncio
 import aiohttp
 import time
+import json
+import redis
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
 
-# --- ¡IMPORTANTE! ---
-# Asegúrate de que tu archivo 'datos.py' esté en el mismo directorio
-# y que contenga la lista 'expedientes' como en tu ejemplo original.
 try:
     from datos import expedientes
 except ImportError:
-    st.error("🚨 No se encontró el archivo 'datos.py'. Asegúrate de que esté en la misma carpeta.")
+    st.error("🚨 No se encontró el archivo 'datos.py'")
     st.stop()
 
 # ==========================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN ULTRA RÁPIDA
 # ==========================================
 API_URL = "https://apiplataformaelectoral3.jne.gob.pe/api/v1/expediente/detalle?CodExpedienteExt={}"
 
 CONFIG = {
-    # Control de concurrencia: ¡Clave para no saturar la API!
-    # Empieza con 10-15 y ajusta si la API lo permite.
-    'semaphore_limit': 15,
-    'request_timeout': 10,  # Timeout en segundos
-    'max_retries': 3,       # Reintentos por petición fallida
-    'retry_delay': 1.5,     # Delay base entre reintentos (backoff exponencial)
-    # Configuración aiohttp
-    'aiohttp_limit': 100,   # Límite total de conexiones simultáneas del pool
-    'aiohttp_limit_per_host': 30, # Conexiones simultáneas al mismo host (JNE)
+    'semaphore_limit': 20,  # Más concurrente
+    'request_timeout': 8,
+    'max_retries': 2,
+    'retry_delay': 0.5,
+    'aiohttp_limit': 200,
+    'aiohttp_limit_per_host': 50,
+    'redis_ttl': 7200,  # 2 horas
+    'refresh_interval': 300,  # 5 minutos
+    'max_requests_per_hour': 120,
+    'cooldown_seconds': 60,
 }
 
 # ==========================================
-# FUNCIONES ASÍNCRONAS DEL CORE
+# REDIS CLOUD CON CACHE
 # ==========================================
+@st.cache_resource
+def init_redis():
+    try:
+        return redis.Redis(
+            host=st.secrets["redis"]["host"],
+            port=st.secrets["redis"]["port"],
+            password=st.secrets["redis"]["password"],
+            decode_responses=True,
+            socket_timeout=3,
+            socket_connect_timeout=3,
+            retry_on_timeout=True
+        )
+    except:
+        return None
 
-async def fetch_expediente(session: aiohttp.ClientSession, item: Dict[str, str], semaphore: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-    """
-    Consulta un solo expediente a la API de forma asíncrona con control de concurrencia y reintentos.
-    """
+redis_client = init_redis()
+
+# ==========================================
+# RATE LIMITER
+# ==========================================
+class RateLimiter:
+    def __init__(self, max_requests, time_window):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
+    
+    def can_request(self):
+        now = time.time()
+        self.requests = [t for t in self.requests if t > now - self.time_window]
+        if len(self.requests) < self.max_requests:
+            self.requests.append(now)
+            return True
+        return False
+
+rate_limiter = RateLimiter(
+    max_requests=CONFIG['max_requests_per_hour'],
+    time_window=3600
+)
+
+# ==========================================
+# FUNCIÓN PRINCIPAL ULTRA RÁPIDA
+# ==========================================
+@st.cache_data(ttl=CONFIG['redis_ttl'])
+def get_cached_resultados():
+    """Obtiene resultados con caché de Streamlit + Redis"""
+    
+    # Intentar obtener de Redis primero
+    if redis_client:
+        try:
+            cached = redis_client.get('todos_resultados')
+            if cached:
+                return json.loads(cached)
+        except:
+            pass
+    
+    # Consultar API
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    resultados = loop.run_until_complete(consultar_todos_expedientes_async(expedientes))
+    loop.close()
+    
+    # Guardar en Redis
+    if redis_client and resultados:
+        try:
+            redis_client.setex('todos_resultados', CONFIG['redis_ttl'], json.dumps(resultados))
+        except:
+            pass
+    
+    return resultados
+
+async def fetch_expediente_rapido(session, item, semaphore):
+    """Versión ultra rápida con Redis por expediente"""
     expediente = item["expediente"]
     codigo_api = f"ERM.2026{expediente}"
-    url = API_URL.format(codigo_api)
-    entidad = item["entidad"]
-
+    cache_key = f"exp:{codigo_api}"
+    
+    # Check Redis individual
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except:
+            pass
+    
+    # Consultar API
     for attempt in range(CONFIG['max_retries'] + 1):
         try:
-            # El semáforo controla cuántas peticiones vuelan al mismo tiempo
             async with semaphore:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=CONFIG['request_timeout'])) as response:
+                async with session.get(
+                    API_URL.format(codigo_api),
+                    timeout=aiohttp.ClientTimeout(total=CONFIG['request_timeout'])
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         
-                        # Extraer datos
-                        estado = (
-                            data.get("datoGeneral", {})
-                            .get("estadoLista", "")
-                            .strip()
-                            .upper()
-                        )
-
-                        # Buscar pronunciamiento
+                        estado = data.get("datoGeneral", {}).get("estadoLista", "").strip().upper()
+                        
                         pron = None
                         for x in data.get("expedienteActuado", []):
                             if x.get("txTipoExpediente") == "PRONUNCIAMIENTO":
                                 pron = x
                                 break
-
-                        return {
+                        
+                        resultado = {
                             "Expediente": expediente,
-                            "Entidad": entidad,
+                            "Entidad": item["entidad"],
                             "Estado Lista": estado,
                             "Ruta Documento": pron.get("txRutaDocumento", "") if pron else "",
                             "Fecha Publicación": pron.get("txFechaPublicacion", "") if pron else "",
                         }
-                    elif response.status == 429:  # Too Many Requests
-                        # Esperar un poco más si nos están rate-limitando
-                        await asyncio.sleep(CONFIG['retry_delay'] * (2 ** attempt))
-                        continue
-                    else:
-                        # Para otros errores (4xx, 5xx), reintentamos si quedan intentos
-                        if attempt < CONFIG['max_retries']:
-                            await asyncio.sleep(CONFIG['retry_delay'] * (attempt + 1))
-                            continue
-                        else:
-                            break
-
-        except asyncio.TimeoutError:
+                        
+                        # Guardar en Redis
+                        if redis_client:
+                            try:
+                                redis_client.setex(cache_key, CONFIG['redis_ttl'], json.dumps(resultado))
+                            except:
+                                pass
+                        
+                        return resultado
+                        
+        except:
             if attempt < CONFIG['max_retries']:
                 await asyncio.sleep(CONFIG['retry_delay'] * (attempt + 1))
-                continue
             else:
                 break
-        except Exception:
-            if attempt < CONFIG['max_retries']:
-                await asyncio.sleep(CONFIG['retry_delay'] * (attempt + 1))
-                continue
-            else:
-                break
-
-    # Si llegamos aquí, agotamos los reintentos o fue un error irrecuperable
+    
     return {
         "Expediente": expediente,
-        "Entidad": entidad,
+        "Entidad": item["entidad"],
         "Estado Lista": "ERROR",
         "Ruta Documento": "",
         "Fecha Publicación": "",
     }
 
-async def consultar_todos_expedientes_async(expedientes_a_consultar: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """
-    Orquesta todas las consultas asíncronas con un pool de conexiones persistente.
-    """
+async def consultar_todos_expedientes_async(expedientes_a_consultar):
+    """Orquesta consultas ultra rápidas"""
     semaphore = asyncio.Semaphore(CONFIG['semaphore_limit'])
-    connector = aiohttp.TCPConnector(limit=CONFIG['aiohttp_limit'], limit_per_host=CONFIG['aiohttp_limit_per_host'])
+    connector = aiohttp.TCPConnector(
+        limit=CONFIG['aiohttp_limit'],
+        limit_per_host=CONFIG['aiohttp_limit_per_host'],
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True
+    )
     timeout = aiohttp.ClientTimeout(total=CONFIG['request_timeout'])
-
-    resultados = []
-
+    
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [
-            fetch_expediente(session, item, semaphore)
-            for item in expedientes_a_consultar
-        ]
-        
-        # Ejecutar las tareas concurrentemente y recoger los resultados
-        # Usamos asyncio.as_completed para mostrar progreso (opcional pero bueno)
-        for coro in asyncio.as_completed(tasks):
-            resultado = await coro
-            resultados.append(resultado)
-            
+        tasks = [fetch_expediente_rapido(session, item, semaphore) for item in expedientes_a_consultar]
+        resultados = await asyncio.gather(*tasks)
+    
     return resultados
 
 # ==========================================
-# FUNCIONES DE CLASIFICACIÓN E INTERFAZ
+# FUNCIONES DE UI
 # ==========================================
-
 def clasificar_expedientes(resultados):
-    """Clasifica los resultados (síncrono, muy rápido)"""
-    admitidos = []
-    inadmisibles = []
-    recibidos = []
-    errores = []
+    admitidos, inadmisibles, recibidos, errores = [], [], [], []
     for item in resultados:
         estado = item["Estado Lista"]
         if estado.startswith("ERROR"):
@@ -160,20 +209,12 @@ def clasificar_expedientes(resultados):
             recibidos.append(item)
     return admitidos, inadmisibles, recibidos, errores
 
-@st.cache_data(ttl=600)
-def convertir_a_dataframe(datos):
-    """Caché para evitar recrear DataFrames idénticos en cada rerun."""
-    if not datos:
-        return pd.DataFrame()
-    df = pd.DataFrame(datos)
-    df.index = range(1, len(df) + 1)
-    return df
-
-def mostrar_tabla(datos, titulo):
+def mostrar_tabla(datos):
     if not datos:
         st.caption("📭 Sin resultados")
         return
-    df = convertir_a_dataframe(datos)
+    df = pd.DataFrame(datos)
+    df.index = range(1, len(df) + 1)
     column_config = {}
     if "Ruta Documento" in df.columns:
         column_config["Ruta Documento"] = st.column_config.LinkColumn(
@@ -183,99 +224,67 @@ def mostrar_tabla(datos, titulo):
     st.dataframe(df, column_config=column_config, width='stretch')
 
 # ==========================================
-# INTERFAZ GRÁFICA DE STREAMLIT
+# INTERFAZ STREAMLIT
 # ==========================================
-
 st.set_page_config(
-    page_title="JNE - Expedientes (Async)",
-    page_icon="📋",
+    page_title="JNE - Expedientes",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
+# CSS Ultra Rápido
 st.markdown("""
     <style>
-    div[data-testid="metric-container"] {
-        background-color: #f0f2f6;
-        border-radius: 10px;
-        padding: 15px;
-    }
-    .stButton button {
-        transition: all 0.3s ease !important;
+    .stButton button { 
         font-weight: 600 !important;
+        transition: all 0.2s !important;
     }
-    .stButton button:hover {
-        transform: scale(1.02);
-    }
+    .stMetric { background-color: #f8f9fa; border-radius: 10px; padding: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-# Inicializar estado de sesión
-if 'procesando' not in st.session_state:
-    st.session_state.procesando = False
+# Estado
+if 'last_refresh' not in st.session_state:
+    st.session_state.last_refresh = None
 if 'resultados' not in st.session_state:
     st.session_state.resultados = None
+# Auto-refresh inteligente
 
-# Layout del botón
-col1, col2, col3 = st.columns([1, 2, 1])
-with col2:
-    consultar_btn = st.button(
-        "🔍 CONSULTAR EXPEDIENTES",
-        width='stretch',
-        type="primary",
-        disabled=st.session_state.procesando
-    )
+def should_refresh():
+    if st.session_state.resultados is None:
+        return True
+    if st.session_state.last_refresh is None:
+        return True
+    elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+    return elapsed > CONFIG['refresh_interval']
 
-# Lógica de consulta
-if consultar_btn and not st.session_state.procesando:
-    st.session_state.procesando = True
-    st.session_state.resultados = None
-    # Forzar rerun para mostrar el estado 'procesando'
-    st.rerun()
+# Carga ultra rápida
+if should_refresh() and rate_limiter.can_request():
+    with st.spinner("⚡ Consultando 40 expedientes...Por favor, espere 🙏"):
+        start = time.time()
+        st.session_state.resultados = get_cached_resultados()
+        st.session_state.last_refresh = datetime.now()
+        elapsed = time.time() - start
+        
+        if elapsed < 2:
+            st.balloons()
+        # st.text(f"✅ ¡Listo! {elapsed:.1f}s")
 
-# Muestra spinner y procesa si está en estado 'procesando'
-if st.session_state.procesando:
-    with st.spinner("⏳ Realizando consultas asíncronas... Por favor, espere."):
-        start_time = time.time()
-        try:
-            # Crear un nuevo event loop para Streamlit
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            resultados_async = loop.run_until_complete(
-                consultar_todos_expedientes_async(expedientes)
-            )
-            loop.close()
-
-            st.session_state.resultados = resultados_async
-            elapsed_time = time.time() - start_time
-            st.success(f"✅ ¡Consulta completada en {elapsed_time:.2f} segundos!")
-        except Exception as e:
-            st.error(f"💥 Error fatal durante la consulta: {e}")
-            st.session_state.resultados = None
-        finally:
-            st.session_state.procesando = False
-            st.rerun()
-
-# Mostrar resultados si existen
+# Mostrar resultados
 if st.session_state.resultados:
     resultados = st.session_state.resultados
     admitidos, inadmisibles, recibidos, errores = clasificar_expedientes(resultados)
-
-    # Métricas
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📊 Total", len(resultados))
-    col2.metric("✅ Admitidos", len(admitidos))
-    col3.metric("❌ Inadmisibles", len(inadmisibles))
-    col4.metric("📦 Recibidos", len(recibidos))
     
-    if errores:
-        st.warning(f"⚠️ {len(errores)} consultas resultaron en error después de múltiples intentos.")
-
-    # Tabs con resultados
-    tab1, tab2, tab3 = st.tabs(["✅ Admitidos", "❌ Inadmisibles", "📦 Recibidos"])
+    # Última actualización
+    if st.session_state.last_refresh:
+        st.markdown(f"🕐 Actualizado: {st.session_state.last_refresh.strftime('%H:%M:%S')} | Total 40 expedientes")
+    
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["✅ Admitidos "+str(len(admitidos)), "❌ Inadmisibles "+str(len(inadmisibles)), "📦 Recibidos "+str(len(recibidos))])
     with tab1:
-        mostrar_tabla(admitidos, "✅ Admitidos")
+        mostrar_tabla(admitidos)
     with tab2:
-        mostrar_tabla(inadmisibles, "❌ Inadmisibles")
+        mostrar_tabla(inadmisibles)
     with tab3:
-        mostrar_tabla(recibidos, "📦 Recibidos")
+        mostrar_tabla(recibidos)
